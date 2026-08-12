@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="src/CS3.ScanBridge/CS3.ScanBridge.csproj" />
+  <Project Path="tests/CS3.ScanBridge.Tests/CS3.ScanBridge.Tests.csproj" />
+</Solution>
