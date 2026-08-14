@@ -34,9 +34,13 @@ internal sealed class FakeBackend(ScannerProvider provider, IReadOnlyList<Scanne
     public ScannerProvider Provider { get; } = provider;
     public IReadOnlyList<ScannerInfo> Scanners { get; } = scanners;
     public int ScanCount { get; private set; }
+    public int EnumerationCount { get; private set; }
 
-    public Task<IReadOnlyList<ScannerInfo>> GetScannersAsync(CancellationToken cancellationToken) =>
-        Task.FromResult(Scanners);
+    public Task<IReadOnlyList<ScannerInfo>> GetScannersAsync(CancellationToken cancellationToken)
+    {
+        EnumerationCount++;
+        return Task.FromResult(Scanners);
+    }
 
     public Task<ScanAcquisition> ScanAsync(AppSettings settings, CancellationToken cancellationToken)
     {

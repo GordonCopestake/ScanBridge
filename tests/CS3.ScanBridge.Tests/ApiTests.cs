@@ -28,6 +28,16 @@ public sealed class ApiTests
     }
 
     [Fact]
+    public async Task DisallowedOriginCannotReadScannerList()
+    {
+        await using var host = await BridgeTestHost.CreateAsync(new FakeScanner());
+        using var request = new HttpRequestMessage(HttpMethod.Get, "/scanners");
+        request.Headers.TryAddWithoutValidation("Origin", "https://evil.invalid");
+        using var response = await host.Client.SendAsync(request);
+        Assert.Equal(HttpStatusCode.Forbidden, response.StatusCode);
+    }
+
+    [Fact]
     public async Task PreflightReturnsRequiredCorsHeaders()
     {
         await using var host = await BridgeTestHost.CreateAsync(new FakeScanner());
@@ -90,11 +100,34 @@ public sealed class ApiTests
     [Fact]
     public async Task UnavailableScannerReturns503()
     {
-        var scanner = new FakeScanner { Scanners = [] };
+        var scanner = new FakeScanner
+        {
+            OnScan = (_, _) => throw new ScannerUnavailableException("missing")
+        };
         await using var host = await BridgeTestHost.CreateAsync(scanner);
         using var response = await host.Client.SendAsync(RequestFactory.Scan());
         Assert.Equal(HttpStatusCode.ServiceUnavailable, response.StatusCode);
+        Assert.Equal(1, scanner.ScanCallCount);
+    }
+
+    [Fact]
+    public async Task OversizedRequestReturns413WithoutScanning()
+    {
+        var scanner = new FakeScanner();
+        await using var host = await BridgeTestHost.CreateAsync(scanner);
+        using var response = await host.Client.SendAsync(RequestFactory.Scan(json:
+            $"{{\"suggestedFilename\":\"{new string('a', 5000)}\"}}"));
+        Assert.Equal(HttpStatusCode.RequestEntityTooLarge, response.StatusCode);
         Assert.Equal(0, scanner.ScanCallCount);
+    }
+
+    [Fact]
+    public async Task ExcessiveScanDataReturns413()
+    {
+        var scanner = new FakeScanner { OnScan = (_, _) => throw new ScanDataLimitException("too large") };
+        await using var host = await BridgeTestHost.CreateAsync(scanner);
+        using var response = await host.Client.SendAsync(RequestFactory.Scan());
+        Assert.Equal(HttpStatusCode.RequestEntityTooLarge, response.StatusCode);
     }
 
     [Fact]

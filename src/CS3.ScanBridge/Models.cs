@@ -71,3 +71,4 @@ public sealed class AppSettings
 public sealed class ScannerUnavailableException(string message) : Exception(message);
 public sealed class NoPagesException(string message) : Exception(message);
 public sealed class ScanTimedOutException(string message, Exception? inner = null) : Exception(message, inner);
+public sealed class ScanDataLimitException(string message) : Exception(message);

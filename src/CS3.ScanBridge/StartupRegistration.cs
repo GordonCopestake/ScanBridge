@@ -23,4 +23,21 @@ public static class StartupRegistration
         using var key = Registry.CurrentUser.OpenSubKey(RunKey, false);
         return key?.GetValue(ValueName) is string;
     }
+
+    public static async Task SaveSettingsAsync(ISettingsStore store, AppSettings settings,
+        CancellationToken cancellationToken = default)
+    {
+        var previousStartupState = IsEnabled();
+        try
+        {
+            SetEnabled(settings.StartWithWindows);
+            await store.SaveAsync(settings, cancellationToken);
+        }
+        catch
+        {
+            try { SetEnabled(previousStartupState); }
+            catch { }
+            throw;
+        }
+    }
 }

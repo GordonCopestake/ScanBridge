@@ -96,18 +96,20 @@ The default settings are 300 DPI, greyscale, automatic paper size with an A4 fal
 
 WIA work runs on one dedicated STA thread. TWAIN work runs in the isolated 32-bit NAPS2 SDK worker. The worker owns the TWAIN message loop, data source manager, driver session, and memory transfer. Device ID, exact name, and provider are stored. A WIA device cannot silently match a TWAIN source or the reverse.
 
-The bridge accepts JPEG, BMP, and TIFF results from WIA. It expands all frames from a multi-frame TIFF. The NAPS2 worker transfers TWAIN images in memory and ScanBridge converts each side to JPEG. Duplex sides stay in the order that the selected driver returns them. The PDF page limit also applies to TIFF frames.
+The NAPS2 acquisition engines convert each returned side to JPEG in memory. ScanBridge embeds those JPEG bytes directly in the PDF, so it does not apply a second lossy JPEG encoding step. Duplex sides stay in the order that the selected driver returns them.
+
+The bridge limits acquired image data to 128 MiB and the generated PDF to 160 MiB. It stops with HTTP 413 if a document exceeds a limit. The request body is limited to 4 KiB.
 
 ## Security design
 
 - Kestrel binds to `127.0.0.1` only.
 - Origins use exact ordinal matching. Wildcards and partial host matches are not accepted.
-- Origin checks happen before scanner enumeration for the scan operation.
+- A present browser origin is checked before every endpoint, including health and scanner enumeration.
 - The required custom header prevents a simple HTML form from starting a scan.
 - CORS headers are returned only for an allowed origin.
 - Browser credentials are not enabled.
 - The request cannot choose local paths or network destinations.
-- Temporary paths are constrained to `%TEMP%\CS3ScanBridge`. Normal scans stay in memory.
+- Scan images and PDFs stay in memory and are not written to temporary files.
 - Unexpected errors return a generic message and an error ID. Technical details stay in the local log.
 - A named mutex permits one application instance per Windows user.
 - The application manifest uses `asInvoker`.
@@ -119,8 +121,9 @@ Loopback and CORS checks reduce risk, but they do not authenticate a local Windo
 Use the .NET 10 SDK:
 
 ```powershell
-dotnet build CS3.ScanBridge.slnx -c Release
-dotnet test CS3.ScanBridge.slnx -c Release
+dotnet restore CS3.ScanBridge.slnx --locked-mode
+dotnet build CS3.ScanBridge.slnx -c Release --no-restore
+dotnet test CS3.ScanBridge.slnx -c Release --no-build
 ```
 
 Automated tests use fake scanner services. They never start a physical scanner.
@@ -139,6 +142,17 @@ dotnet publish src/CS3.ScanBridge/CS3.ScanBridge.csproj `
 ```
 
 Trimming is disabled because WIA COM, TWAIN, and Windows Forms depend on native integration, COM metadata, and reflection. The normal-use publish folder contains one self-contained EXE.
+
+## Signed releases
+
+The CI workflow builds and tests each update to `main` and each pull request with locked NuGet dependencies. A tag such as `v1.4.0` starts the release workflow. The workflow will publish a release only after it signs the EXE with Authenticode and verifies the signature.
+
+Configure these GitHub Actions secrets before you push a release tag:
+
+- `WINDOWS_SIGNING_CERTIFICATE_BASE64`: the Base64 text of the code-signing PFX file
+- `WINDOWS_SIGNING_CERTIFICATE_PASSWORD`: the PFX password
+
+The workflow fails if either secret is absent. It does not create an unsigned release.
 
 ## Troubleshooting
 
@@ -167,7 +181,7 @@ No commercial run-time licence is required.
 
 WIA and TWAIN are driver-defined APIs. A driver can omit a setting, reject a documented value, return more than one page in one TIFF, or ignore cancellation. The bridge applies advertised settings only, releases WIA COM objects, closes TWAIN sessions on success and error paths, and keeps the scan lock until a late driver call ends. Duplex order depends on the selected driver. The code keeps the returned order and expands multi-frame TIFFs without sorting.
 
-The automated checks cover exact origins, wildcard and partial-origin rejection, required headers, preflight, private-network preflight, health, busy and unavailable scanner responses, timeout, filename sanitizing, settings persistence, PDF headers, one-page and two-page PDFs, temporary cleanup, and safe error responses.
+The automated checks cover exact origins, wildcard and partial-origin rejection, required headers, request limits, preflight, private-network preflight, health, busy and unavailable scanner responses, timeout, filename sanitizing, settings persistence, scan memory limits, scanner option mapping, device-name fallback, PDF headers, one-page and two-page PDFs, and safe error responses.
 
 A physical document is still needed to confirm DS-740D duplex order, feeder end-of-paper behavior, supported property values, and real scan quality. Do not use **Test scanner** until a document is loaded.
 
@@ -194,5 +208,15 @@ A physical document is still needed to confirm DS-740D duplex order, feeder end-
 - The final `win-x64` publish folder contains one self-contained EXE.
 - Version 1.2.1 uses the NAPS2 SDK 32-bit worker because the Brother driver returns `NoDS` when direct in-process TWAIN tries to open it. A connection-only capability test through the worker opened the source successfully.
 - Version 1.2.2 matches the proven NAPS2 DS-740D profile for right-aligned A4 layout and post-scan brightness and contrast processing. This avoids sending controls that make the Brother driver return its generic `Bummer` error.
+- Version 1.2.4 keeps the selected WIA device object alive until acquisition completes and refreshes the Windows startup entry after an application update.
+- Version 1.2.5 leaves page-count control to the WIA driver and ignores rejected optional WIA settings. Scan Bridge still enforces its configured page limit during transfer.
+- Version 1.2.6 selects only WIA document-handling flags that the scanner advertises. ADF selection is required, so a rejected ADF mode cannot fall back to the flatbed.
+- Version 1.2.7 checks WIA feeder-ready status before each scan. It uses the ADF when paper is loaded and falls back to a single flatbed page when the ADF is empty.
+- Version 1.2.8 lets WIA use the device's preferred image format and applies paper size at device level. This supports eSCL WIA drivers that reject an explicit transfer format.
+- Version 1.2.9 sets the WIA acquisition page count before transfer. Duplex ADF requests use an even page count, while flatbed requests remain limited to one page.
+- Version 1.2.10 sets the WIA ADF page count to zero, which requests all currently loaded pages. Scan Bridge still limits returned pages to its configured maximum; flatbed scans remain one page.
+- Version 1.3.0 replaces raw WIA Automation transfer with the NAPS2 SDK native WIA 2 acquisition engine. The bridge retains its live ADF-to-flatbed source selection and configured page limit.
+- Version 1.3.1 enables safe single-file compression while keeping the application self-contained and untrimmed.
+- Version 1.4.0 keeps the WinForms loop on its STA thread, caches device discovery, uses live TWAIN device records, limits scan memory, embeds JPEG pages without re-encoding, locks NuGet dependencies, and adds CI plus signed releases.
 - The updated process listened only on `127.0.0.1:9175`; a disallowed origin returned HTTP 403 before scanner access.
 - A physical document is still required to verify Brother capability negotiation, duplex side order, and scan output.

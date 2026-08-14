@@ -28,4 +28,16 @@ public sealed class ScannerServiceTests
         Assert.Equal(0, wia.ScanCount);
         Assert.Equal(1, twain.ScanCount);
     }
+
+    [Fact]
+    public async Task RepeatedEnumerationUsesShortCache()
+    {
+        var wia = new FakeBackend(ScannerProvider.Wia, [new("wia-id", "Printer")]);
+        var service = new ScannerService([wia], NullLogger<ScannerService>.Instance);
+
+        await Task.WhenAll(Enumerable.Range(0, 20)
+            .Select(_ => service.GetScannersAsync(TestContext.Current.CancellationToken)));
+
+        Assert.Equal(1, wia.EnumerationCount);
+    }
 }

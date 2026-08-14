@@ -8,6 +8,7 @@ namespace CS3.ScanBridge;
 
 public static class BridgeWebApp
 {
+    private const int MaximumRequestBytes = 4096;
     private static readonly HashSet<string> AllowedScanProperties = new(StringComparer.Ordinal)
     {
         "correlationId", "suggestedFilename"
@@ -34,6 +35,12 @@ public static class BridgeWebApp
         {
             var settings = context.RequestServices.GetRequiredService<ISettingsStore>().Current;
             var origin = context.Request.Headers.Origin.ToString();
+            if (!string.IsNullOrWhiteSpace(origin) && !OriginPolicy.IsAllowed(origin, settings.AllowedOrigins))
+            {
+                context.Response.StatusCode = StatusCodes.Status403Forbidden;
+                await context.Response.WriteAsJsonAsync(new BridgeError("The origin is not allowed."));
+                return;
+            }
             if (OriginPolicy.IsAllowed(origin, settings.AllowedOrigins))
                 context.Response.Headers.AccessControlAllowOrigin = origin;
             context.Response.Headers.Append(HeaderNames.Vary, "Origin");
@@ -97,7 +104,12 @@ public static class BridgeWebApp
         ScanRequest request;
         try
         {
-            using var document = await JsonDocument.ParseAsync(context.Request.Body, cancellationToken: context.RequestAborted);
+            if (context.Request.ContentLength > MaximumRequestBytes)
+                return JsonError(StatusCodes.Status413PayloadTooLarge, "The scan request is too large.");
+            using var body = await ReadRequestBodyAsync(context.Request.Body, context.RequestAborted);
+            if (body is null)
+                return JsonError(StatusCodes.Status413PayloadTooLarge, "The scan request is too large.");
+            using var document = await JsonDocument.ParseAsync(body, cancellationToken: context.RequestAborted);
             if (document.RootElement.ValueKind != JsonValueKind.Object ||
                 document.RootElement.EnumerateObject().Any(property => !AllowedScanProperties.Contains(property.Name)))
                 return JsonError(StatusCodes.Status400BadRequest, "The scan request contains unsupported fields.");
@@ -110,17 +122,6 @@ public static class BridgeWebApp
         if (coordinator.IsBusy) return JsonError(StatusCodes.Status409Conflict, "The scanner is busy.");
         try
         {
-            var settings = store.Current;
-            IReadOnlyList<ScannerInfo> scanners;
-            try { scanners = await scanner.GetScannersAsync(context.RequestAborted); }
-            catch (Exception exception)
-            {
-                logger.LogWarning(exception, "Scanner enumeration failed before a scan request");
-                return JsonError(StatusCodes.Status503ServiceUnavailable, "The configured scanner is unavailable.");
-            }
-            if (FindConfiguredScanner(settings, scanners) is null)
-                return JsonError(StatusCodes.Status503ServiceUnavailable, "The configured scanner is unavailable.");
-
             var outcome = await coordinator.ScanAsync(request, context.RequestAborted);
             context.Response.Headers.CacheControl = "no-store";
             context.Response.ContentLength = outcome.Pdf.LongLength;
@@ -130,6 +131,7 @@ public static class BridgeWebApp
         catch (NoPagesException) { return JsonError(StatusCodes.Status422UnprocessableEntity, "No document or pages were acquired."); }
         catch (ScannerUnavailableException) { return JsonError(StatusCodes.Status503ServiceUnavailable, "The configured scanner is unavailable."); }
         catch (ScanTimedOutException) { return JsonError(StatusCodes.Status504GatewayTimeout, "The scan timed out."); }
+        catch (ScanDataLimitException) { return JsonError(StatusCodes.Status413PayloadTooLarge, "The scanned document is too large."); }
         catch (OperationCanceledException) when (context.RequestAborted.IsCancellationRequested)
         {
             return JsonError(499, "The request was cancelled.");
@@ -140,6 +142,27 @@ public static class BridgeWebApp
             status.LastErrorId = errorId;
             logger.LogError(exception, "Unexpected scan or PDF error {ErrorId}", errorId);
             return JsonError(StatusCodes.Status500InternalServerError, "The scan could not be completed.", errorId);
+        }
+    }
+
+    private static async Task<MemoryStream?> ReadRequestBodyAsync(Stream input, CancellationToken cancellationToken)
+    {
+        var output = new MemoryStream();
+        var buffer = new byte[1024];
+        while (true)
+        {
+            var read = await input.ReadAsync(buffer, cancellationToken);
+            if (read == 0)
+            {
+                output.Position = 0;
+                return output;
+            }
+            if (output.Length + read > MaximumRequestBytes)
+            {
+                output.Dispose();
+                return null;
+            }
+            await output.WriteAsync(buffer.AsMemory(0, read), cancellationToken);
         }
     }
 

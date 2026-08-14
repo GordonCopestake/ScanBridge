@@ -1,6 +1,6 @@
 namespace CS3.ScanBridge.Tests;
 
-public sealed class PersistenceAndTemporaryDataTests
+public sealed class PersistenceTests
 {
     [Fact]
     public async Task SettingsValidateAndPersistAtomically()
@@ -27,22 +27,5 @@ public sealed class PersistenceAndTemporaryDataTests
             await Assert.ThrowsAsync<ArgumentException>(() => store.SaveAsync(settings));
         }
         finally { if (Directory.Exists(directory)) Directory.Delete(directory, true); }
-    }
-
-    [Fact]
-    public void TemporaryScanDirectoryIsCleanedAndGuarded()
-    {
-        var parent = Path.Combine(Path.GetTempPath(), "CS3ScanBridgeTests", Guid.NewGuid().ToString("N"));
-        Directory.CreateDirectory(parent);
-        try
-        {
-            var temporary = new TemporaryData(parent);
-            var scan = temporary.CreateScanDirectory();
-            File.WriteAllText(Path.Combine(scan, "page.tmp"), "data");
-            temporary.DeleteScanDirectory(scan);
-            Assert.False(Directory.Exists(scan));
-            Assert.Throws<InvalidOperationException>(() => temporary.DeleteScanDirectory(parent));
-        }
-        finally { if (Directory.Exists(parent)) Directory.Delete(parent, true); }
     }
 }

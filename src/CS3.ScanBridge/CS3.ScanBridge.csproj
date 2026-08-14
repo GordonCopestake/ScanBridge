@@ -7,10 +7,11 @@
     <EnableDefaultContentItems>false</EnableDefaultContentItems>
     <AssemblyName>CS3.ScanBridge</AssemblyName>
     <RootNamespace>CS3.ScanBridge</RootNamespace>
-    <Version>1.2.3</Version>
+    <Version>1.4.0</Version>
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>
     <PlatformTarget>x64</PlatformTarget>
     <PublishSingleFile>true</PublishSingleFile>
+    <EnableCompressionInSingleFile>true</EnableCompressionInSingleFile>
     <PublishTrimmed>false</PublishTrimmed>
     <DebugType>embedded</DebugType>
     <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>

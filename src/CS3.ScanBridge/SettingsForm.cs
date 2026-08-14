@@ -31,6 +31,7 @@ public sealed class SettingsForm : Form
     private readonly Label warning = new() { AutoSize = true, ForeColor = Color.DarkRed, MaximumSize = new Size(520, 0) };
     private readonly System.Windows.Forms.Timer timer = new() { Interval = 1000 };
     private bool allowClose;
+    private bool refreshingScanners;
 
     public SettingsForm(IServiceProvider services, ISettingsStore store, string logDirectory, int activePort, bool configurationWarning)
     {
@@ -110,6 +111,8 @@ public sealed class SettingsForm : Form
 
     private async Task RefreshScannersAsync()
     {
+        if (refreshingScanners) return;
+        refreshingScanners = true;
         try
         {
             var scannerService = services.GetRequiredService<IScannerService>();
@@ -120,10 +123,13 @@ public sealed class SettingsForm : Form
             scanner.Items.Clear();
             foreach (var device in devices) scanner.Items.Add(new ScannerChoice(device.Id, device.Name, device.Provider));
             scanner.SelectedItem = scanner.Items.Cast<ScannerChoice>().FirstOrDefault(value =>
-                value.Provider == selectedProvider && value.Id == selectedId);
+                                       value.Provider == selectedProvider && value.Id == selectedId) ??
+                                   scanner.Items.Cast<ScannerChoice>().FirstOrDefault(value =>
+                                       value.Provider == selectedProvider && value.Name == current.ScannerName);
             availability.Text = scanner.Items.Count == 0 ? "No WIA or TWAIN scanner source registered" : $"{scanner.Items.Count} scanner source(s) registered";
         }
         catch { availability.Text = "Scanner enumeration failed"; }
+        finally { refreshingScanners = false; }
     }
 
     private async Task RefreshStatusAsync()
@@ -136,7 +142,7 @@ public sealed class SettingsForm : Form
         if (!status.Busy && scanner.Items.Count == 0) await RefreshScannersAsync();
     }
 
-    private async Task SaveAsync()
+    private async Task<bool> SaveAsync()
     {
         try
         {
@@ -157,17 +163,22 @@ public sealed class SettingsForm : Form
                 AllowedOrigins = origins.Lines.Select(value => value.Trim()).Where(value => value.Length > 0).Distinct(StringComparer.Ordinal).ToList(),
                 StartWithWindows = startup.Checked
             };
-            await store.SaveAsync(settings);
-            StartupRegistration.SetEnabled(settings.StartWithWindows);
+            await StartupRegistration.SaveSettingsAsync(store, settings);
             warning.Text = settings.ListenerPort == activePort ? "Settings saved." : "Settings saved. Restart CS3 Scan Bridge to use the new listener port.";
+            return true;
         }
-        catch (Exception exception) { warning.Text = $"Settings were not saved: {exception.Message}"; }
+        catch (Exception exception)
+        {
+            warning.Text = $"Settings were not saved: {exception.Message}";
+            return false;
+        }
     }
 
     private async Task TestScannerAsync()
     {
         if (MessageBox.Show("Load a document in the scanner. Start a physical test scan?", "CS3 Scan Bridge",
             MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes) return;
+        if (!await SaveAsync()) return;
         try
         {
             var result = await services.GetRequiredService<ScanCoordinator>()

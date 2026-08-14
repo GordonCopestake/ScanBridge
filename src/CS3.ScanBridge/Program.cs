@@ -7,7 +7,7 @@ namespace CS3.ScanBridge;
 internal static class Program
 {
     [STAThread]
-    private static async Task Main(string[] args)
+    private static void Main(string[] args)
     {
         using var instance = CreateInstanceMutex(out var ownsMutex);
         if (!ownsMutex)
@@ -33,14 +33,15 @@ internal static class Program
         {
             SettingsStore store = new(localData);
             AppSettings settings;
-            try { settings = await store.LoadAsync(); }
+            try { settings = store.LoadAsync().GetAwaiter().GetResult(); }
             catch (Exception exception)
             {
                 Log.Error(exception, "Settings could not be loaded; safe defaults will be used");
                 store = new SettingsStore(localData);
                 settings = new AppSettings();
             }
-            new TemporaryData().DeleteAbandonedDirectories(TimeSpan.FromDays(1));
+            try { StartupRegistration.SetEnabled(settings.StartWithWindows); }
+            catch (Exception exception) { Log.Warning(exception, "The Windows startup setting could not be synchronized"); }
 
             var builder = WebApplication.CreateBuilder(args);
             builder.Host.UseSerilog();
@@ -55,7 +56,7 @@ internal static class Program
             builder.Services.ConfigureHttpJsonOptions(options => options.SerializerOptions.PropertyNamingPolicy = System.Text.Json.JsonNamingPolicy.CamelCase);
             app = builder.Build();
             BridgeWebApp.MapEndpoints(app);
-            await app.StartAsync();
+            app.StartAsync().GetAwaiter().GetResult();
 
             ApplicationConfiguration.Initialize();
             using var tray = new TrayApplicationContext(app.Services, store, logDirectory, settings.ListenerPort);
@@ -72,10 +73,10 @@ internal static class Program
         {
             if (app is not null)
             {
-                try { await app.StopAsync(TimeSpan.FromSeconds(10)); }
-                finally { await app.DisposeAsync(); }
+                try { app.StopAsync(TimeSpan.FromSeconds(10)).GetAwaiter().GetResult(); }
+                finally { app.DisposeAsync().AsTask().GetAwaiter().GetResult(); }
             }
-            await Log.CloseAndFlushAsync();
+            Log.CloseAndFlushAsync().GetAwaiter().GetResult();
         }
     }
 

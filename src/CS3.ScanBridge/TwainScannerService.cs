@@ -1,7 +1,6 @@
 using NAPS2.Images;
 using NAPS2.Images.Gdi;
 using NAPS2.Scan;
-using NTwain.Data;
 
 namespace CS3.ScanBridge;
 
@@ -26,40 +25,20 @@ public sealed class TwainScannerService(ILogger<TwainScannerService> logger) : I
     {
         using var context = CreateContext();
         var controller = new ScanController(context);
-        var device = new ScanDevice(
-            Driver.Twain,
-            settings.ScannerDeviceId ?? settings.ScannerName ?? string.Empty,
-            settings.ScannerName ?? settings.ScannerDeviceId ?? string.Empty);
-        var options = new ScanOptions
+        ScanDevice device;
+        try
         {
-            Driver = Driver.Twain,
-            Device = device,
-            Dpi = settings.Dpi,
-            BitDepth = settings.ColourMode switch
-            {
-                ScanColourMode.Colour => BitDepth.Color,
-                ScanColourMode.Greyscale => BitDepth.Grayscale,
-                _ => BitDepth.BlackAndWhite
-            },
-            PaperSource = settings.Duplex ? PaperSource.Duplex : PaperSource.Feeder,
-            // The DS-740D has an A4-width transport. NAPS2 requires an explicit page size.
-            PageSize = PageSize.A4,
-            // Match the proven NAPS2 DS-740D profile. Left alignment offsets A4 inside the
-            // 8.5-inch transport and this Brother driver can reject that image layout.
-            PageAlign = HorizontalAlign.Right,
-            // Do not send brightness and contrast controls to the driver. The saved NAPS2
-            // profile also applies these after acquisition.
-            BrightnessContrastAfterScan = true,
-            Quality = settings.JpegQuality,
-            TwainOptions = new TwainOptions
-            {
-                Dsm = TwainDsm.New,
-                TransferMode = TwainTransferMode.Memory,
-                ShowProgress = false
-            }
-        };
+            var devices = await GetDevicesAsync(controller, cancellationToken);
+            device = ScannerConfiguration.SelectDevice(settings, devices) ??
+                     throw new ScannerUnavailableException("The configured TWAIN scanner is no longer registered.");
+        }
+        catch (Exception exception) when (ScannerFailureMessage.DescribeKnown("TWAIN", exception) is not null)
+        {
+            throw new ScannerUnavailableException(ScannerFailureMessage.DescribeKnown("TWAIN", exception)!);
+        }
+        var options = ScannerConfiguration.CreateTwainOptions(settings, device);
 
-        var pages = new List<ScanPage>();
+        var pages = new ScanPageBuffer();
         using var workerCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         var stoppedAtPageLimit = false;
         try
@@ -71,9 +50,9 @@ public sealed class TwainScannerService(ILogger<TwainScannerService> logger) : I
                 {
                     if (pages.Count < settings.MaximumPages)
                     {
-                        using var output = new MemoryStream();
+                        using var output = new SizeLimitedMemoryStream(pages.RemainingBytes);
                         image.Save(output, ImageFileFormat.Jpeg, new ImageSaveOptions { Quality = settings.JpegQuality });
-                        pages.Add(new ScanPage(output.ToArray(), "jpeg"));
+                        pages.Add(output.ToArray(), "jpeg");
                     }
                 }
 
@@ -92,14 +71,14 @@ public sealed class TwainScannerService(ILogger<TwainScannerService> logger) : I
         {
             throw;
         }
-        catch (Exception exception)
+        catch (Exception exception) when (ScannerFailureMessage.DescribeKnown("TWAIN", exception) is not null)
         {
             logger.LogWarning(exception, "NAPS2 worker failed to scan with TWAIN source {SourceId}", device.ID);
-            throw new ScannerUnavailableException(DescribeWorkerFailure(exception));
+            throw new ScannerUnavailableException(ScannerFailureMessage.DescribeKnown("TWAIN", exception)!);
         }
 
         if (pages.Count == 0) throw new NoPagesException("No document or pages were acquired.");
-        return new ScanAcquisition(pages);
+        return new ScanAcquisition(pages.Pages);
     }
 
     private ScanningContext CreateContext()
@@ -115,47 +94,16 @@ public sealed class TwainScannerService(ILogger<TwainScannerService> logger) : I
         TwainOptions = new TwainOptions { Dsm = TwainDsm.New }
     };
 
-    private static string DescribeWorkerFailure(Exception exception) => exception.GetType().Name switch
+    private static async Task<IReadOnlyList<ScanDevice>> GetDevicesAsync(
+        ScanController controller,
+        CancellationToken cancellationToken)
     {
-        "DeviceNotFoundException" => "The configured TWAIN scanner is no longer registered.",
-        "DeviceOfflineException" => "The TWAIN scanner is offline or disconnected.",
-        "DeviceCommunicationException" => "Communication with the TWAIN scanner failed.",
-        "DevicePaperJamException" => "The TWAIN scanner reports a paper jam.",
-        "DeviceBusyException" => "Another program is using the TWAIN scanner.",
-        "DeviceException" => $"The TWAIN driver reported an error: {exception.Message}",
-        _ => $"The NAPS2 TWAIN worker failed: {exception.Message}"
-    };
-}
-
-internal static class TwainFailureMessage
-{
-    public static string Describe(string operation, ReturnCode returnCode, ConditionCode? conditionCode)
-    {
-        var action = (returnCode, conditionCode) switch
+        var devices = new List<ScanDevice>();
+        await foreach (var device in controller.GetDevices(CreateDiscoveryOptions(), cancellationToken)
+                           .WithCancellation(cancellationToken))
         {
-            (ReturnCode.Busy or ReturnCode.ScannerLocked, _) or (_, ConditionCode.MaxConnections) =>
-                "Another program is using the scanner. Close NAPS2 and Brother scanning software, then try again.",
-            (_, ConditionCode.CheckDeviceOnline) =>
-                "The scanner is offline. Connect its USB cable, turn it on, and wait for Windows to detect it.",
-            (_, ConditionCode.NoDS) =>
-                "The TWAIN driver is unavailable. Repair or reinstall the Brother scanner package.",
-            (_, ConditionCode.NoMedia) =>
-                "No document is loaded in the scanner.",
-            (_, ConditionCode.PaperJam) =>
-                "The scanner reports a paper jam.",
-            (_, ConditionCode.PaperDoubleFeed) =>
-                "The scanner reports a double feed.",
-            (_, ConditionCode.SeqError) =>
-                "The TWAIN driver is in an invalid state. Close other scanning programs and restart CS3 Scan Bridge.",
-            (_, ConditionCode.Denied) =>
-                "The scanner denied access. Close other scanning programs and try again.",
-            _ =>
-                "Confirm that the scanner is connected, turned on, and not open in another scanning program."
-        };
-
-        var status = conditionCode is null
-            ? $"return code: {returnCode}"
-            : $"return code: {returnCode}; condition code: {conditionCode}";
-        return $"TWAIN could not {operation}. {action} ({status})";
+            devices.Add(device);
+        }
+        return devices;
     }
 }

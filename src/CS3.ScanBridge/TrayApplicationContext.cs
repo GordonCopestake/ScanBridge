@@ -11,6 +11,7 @@ public sealed class TrayApplicationContext : ApplicationContext
     private readonly NotifyIcon notifyIcon;
     private SettingsForm? form;
     private bool exiting;
+    private bool changingStartup;
 
     public TrayApplicationContext(IServiceProvider services, ISettingsStore store, string logDirectory, int activePort)
     {
@@ -67,15 +68,20 @@ public sealed class TrayApplicationContext : ApplicationContext
 
     private async Task SetStartupAsync(bool enabled)
     {
+        if (changingStartup) return;
         try
         {
-            StartupRegistration.SetEnabled(enabled);
             var settings = store.Current;
             settings.StartWithWindows = enabled;
-            await store.SaveAsync(settings);
+            await StartupRegistration.SaveSettingsAsync(store, settings);
         }
         catch (Exception exception)
         {
+            changingStartup = true;
+            if (notifyIcon.ContextMenuStrip?.Items.OfType<ToolStripMenuItem>()
+                    .FirstOrDefault(item => item.Text == "Start with Windows") is { } startup)
+                startup.Checked = store.Current.StartWithWindows;
+            changingStartup = false;
             MessageBox.Show($"The startup setting could not be changed: {exception.Message}", "CS3 Scan Bridge",
                 MessageBoxButtons.OK, MessageBoxIcon.Error);
         }

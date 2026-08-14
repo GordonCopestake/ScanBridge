@@ -14,6 +14,16 @@ public sealed class PdfComposer : IPdfComposer
         var pageCount = 0;
         foreach (var scanPage in pages)
         {
+            if (string.Equals(scanPage.Format, "jpeg", StringComparison.OrdinalIgnoreCase))
+            {
+                using var jpegSource = new MemoryStream(scanPage.Data, false);
+                using var jpeg = XImage.FromStream(jpegSource);
+                AddPage(document, jpeg);
+                pageCount++;
+                if (pageCount >= maximumPages) break;
+                continue;
+            }
+
             using var source = new MemoryStream(scanPage.Data, false);
             using var image = Image.FromStream(source, true, true);
             var frameDimension = new FrameDimension(image.FrameDimensionsList[0]);
@@ -28,7 +38,7 @@ public sealed class PdfComposer : IPdfComposer
             }
             if (pageCount >= maximumPages) break;
         }
-        using var output = new MemoryStream();
+        using var output = new SizeLimitedMemoryStream(ScanLimits.MaximumPdfBytes);
         document.Save(output, false);
         return new(output.ToArray(), pageCount);
     }
@@ -52,6 +62,15 @@ public sealed class PdfComposer : IPdfComposer
         page.Height = XUnit.FromPoint(height / dpiY * 72d);
         using var graphics = XGraphics.FromPdfPage(page);
         graphics.DrawImage(xImage, 0, 0, page.Width.Point, page.Height.Point);
+    }
+
+    private static void AddPage(PdfDocument document, XImage image)
+    {
+        var page = document.AddPage();
+        page.Width = XUnit.FromPoint(image.PointWidth);
+        page.Height = XUnit.FromPoint(image.PointHeight);
+        using var graphics = XGraphics.FromPdfPage(page);
+        graphics.DrawImage(image, 0, 0, page.Width.Point, page.Height.Point);
     }
 
     private static double SafeDpi(float dpi) => dpi is > 20 and < 2400 ? dpi : 300d;

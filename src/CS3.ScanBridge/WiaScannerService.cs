@@ -1,32 +1,132 @@
 using System.Runtime.InteropServices;
-using Microsoft.Extensions.Logging;
+using NAPS2.Images;
+using NAPS2.Images.Gdi;
+using NAPS2.Scan;
 
 namespace CS3.ScanBridge;
 
-public sealed class WiaScannerService : IScannerBackend, IDisposable
+public sealed class WiaScannerService(ILogger<WiaScannerService> logger) : IScannerBackend, IDisposable
 {
-    private const int WiaErrorPaperEmpty = unchecked((int)0x80210003);
-    private const int WiaErrorDeviceCommunication = unchecked((int)0x8021000A);
-    private readonly StaWorker worker;
-    private readonly ILogger<WiaScannerService> logger;
-
-    public WiaScannerService(ILogger<WiaScannerService> logger)
-    {
-        this.logger = logger;
-        worker = new StaWorker();
-    }
+    private readonly StaWorker worker = new();
 
     public ScannerProvider Provider => ScannerProvider.Wia;
 
-    public Task<IReadOnlyList<ScannerInfo>> GetScannersAsync(CancellationToken cancellationToken) =>
-        worker.InvokeAsync<IReadOnlyList<ScannerInfo>>(EnumerateScanners, cancellationToken);
-
-    public Task<ScanAcquisition> ScanAsync(AppSettings settings, CancellationToken cancellationToken) =>
-        worker.InvokeAsync(() => Acquire(settings), cancellationToken);
-
-    private static IReadOnlyList<ScannerInfo> EnumerateScanners()
+    public async Task<IReadOnlyList<ScannerInfo>> GetScannersAsync(CancellationToken cancellationToken)
     {
-        var result = new List<ScannerInfo>();
+        using var context = CreateContext();
+        var controller = new ScanController(context);
+        var scanners = new List<ScannerInfo>();
+        await foreach (var device in controller.GetDevices(CreateDiscoveryOptions(), cancellationToken)
+                           .WithCancellation(cancellationToken))
+        {
+            scanners.Add(new ScannerInfo(device.ID, device.Name, ScannerProvider.Wia));
+        }
+        return scanners;
+    }
+
+    public async Task<ScanAcquisition> ScanAsync(AppSettings settings, CancellationToken cancellationToken)
+    {
+        using var context = CreateContext();
+        var controller = new ScanController(context);
+        ScanDevice device;
+        try
+        {
+            var devices = await GetDevicesAsync(controller, cancellationToken);
+            device = ScannerConfiguration.SelectDevice(settings, devices) ??
+                     throw new ScannerUnavailableException("The configured WIA scanner is no longer registered.");
+        }
+        catch (Exception exception) when (ScannerFailureMessage.DescribeKnown("WIA", exception) is not null)
+        {
+            throw new ScannerUnavailableException(ScannerFailureMessage.DescribeKnown("WIA", exception)!);
+        }
+
+        var documentHandlingStatus = await ReadDocumentHandlingStatusAsync(device.Name, cancellationToken);
+        var source = WiaDocumentSourceSelector.Select(documentHandlingStatus, settings.Duplex);
+        var options = ScannerConfiguration.CreateWiaOptions(settings, device, source);
+
+        logger.LogInformation("NAPS2 WIA 2 selected {DocumentSource} from document handling status {DocumentHandlingStatus}",
+            source.Description, documentHandlingStatus);
+
+        var pages = new ScanPageBuffer();
+        using var pageLimitCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        var stoppedAtPageLimit = false;
+        try
+        {
+            await foreach (var image in controller.Scan(options, pageLimitCancellation.Token)
+                               .WithCancellation(pageLimitCancellation.Token))
+            {
+                using (image)
+                {
+                    if (pages.Count < settings.MaximumPages)
+                    {
+                        using var output = new SizeLimitedMemoryStream(pages.RemainingBytes);
+                        image.Save(output, ImageFileFormat.Jpeg,
+                            new ImageSaveOptions { Quality = settings.JpegQuality });
+                        pages.Add(output.ToArray(), "jpeg");
+                    }
+                }
+
+                if (pages.Count >= settings.MaximumPages)
+                {
+                    stoppedAtPageLimit = true;
+                    pageLimitCancellation.Cancel();
+                }
+            }
+        }
+        catch (OperationCanceledException) when (stoppedAtPageLimit && !cancellationToken.IsCancellationRequested)
+        {
+            // The configured limit intentionally stops acquisition after the last accepted page.
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception exception) when (ScannerFailureMessage.DescribeKnown("WIA", exception) is not null)
+        {
+            logger.LogWarning(exception, "NAPS2 WIA 2 failed to scan source {SourceId}", device.ID);
+            throw new ScannerUnavailableException(ScannerFailureMessage.DescribeKnown("WIA", exception)!);
+        }
+
+        if (pages.Count == 0) throw new NoPagesException("No document or pages were acquired.");
+        return new ScanAcquisition(pages.Pages);
+    }
+
+    private ScanningContext CreateContext() => new(new GdiImageContext()) { Logger = logger };
+
+    private static ScanOptions CreateDiscoveryOptions() => new()
+    {
+        Driver = Driver.Wia,
+        WiaOptions = new WiaOptions { WiaApiVersion = WiaApiVersion.Wia20 }
+    };
+
+    private static async Task<IReadOnlyList<ScanDevice>> GetDevicesAsync(
+        ScanController controller,
+        CancellationToken cancellationToken)
+    {
+        var devices = new List<ScanDevice>();
+        await foreach (var device in controller.GetDevices(CreateDiscoveryOptions(), cancellationToken)
+                           .WithCancellation(cancellationToken))
+        {
+            devices.Add(device);
+        }
+        return devices;
+    }
+
+    private async Task<int?> ReadDocumentHandlingStatusAsync(string scannerName, CancellationToken cancellationToken)
+    {
+        try
+        {
+            return await worker.InvokeAsync(() => ReadDocumentHandlingStatus(scannerName), cancellationToken);
+        }
+        catch (Exception exception) when (exception is COMException or ArgumentException or InvalidComObjectException)
+        {
+            logger.LogInformation(exception, "WIA document handling status is unavailable; ADF will be preferred");
+            return null;
+        }
+    }
+
+    private static int? ReadDocumentHandlingStatus(string scannerName)
+    {
         dynamic? manager = null;
         dynamic? infos = null;
         try
@@ -37,211 +137,28 @@ public sealed class WiaScannerService : IScannerBackend, IDisposable
             for (var index = 1; index <= count; index++)
             {
                 dynamic? info = null;
+                dynamic? device = null;
                 try
                 {
                     info = infos[index];
                     if ((int)info.Type != WiaConstants.ScannerDeviceType) continue;
-                    var id = ReadPropertyAsString(info.Properties, WiaConstants.DeviceId);
-                    var name = ReadPropertyAsString(info.Properties, WiaConstants.DeviceName);
-                    if (!string.IsNullOrWhiteSpace(id) && !string.IsNullOrWhiteSpace(name)) result.Add(new(id, name));
+                    if (!string.Equals(ReadPropertyAsString(info.Properties, WiaConstants.DeviceName), scannerName,
+                            StringComparison.Ordinal)) continue;
+                    device = info.Connect();
+                    return ReadPropertyAsInt(device.Properties, WiaConstants.DocumentHandlingStatus);
                 }
-                finally { ReleaseCom(info); }
+                finally
+                {
+                    ReleaseCom(device);
+                    ReleaseCom(info);
+                }
             }
+            return null;
         }
         finally
         {
             ReleaseCom(infos);
             ReleaseCom(manager);
-        }
-        return result;
-    }
-
-    private ScanAcquisition Acquire(AppSettings settings)
-    {
-        dynamic? manager = null;
-        dynamic? infos = null;
-        dynamic? selectedInfo = null;
-        dynamic? device = null;
-        dynamic? items = null;
-        dynamic? item = null;
-        try
-        {
-            manager = CreateComObject("WIA.DeviceManager");
-            infos = manager.DeviceInfos;
-            selectedInfo = FindConfiguredDevice(infos, settings);
-            if (selectedInfo is null) throw new ScannerUnavailableException("The configured scanner is unavailable.");
-            device = selectedInfo.Connect();
-            ApplyDeviceSettings(device, settings);
-            items = device.Items;
-            if ((int)items.Count < 1) throw new ScannerUnavailableException("The configured scanner has no acquisition source.");
-            item = items[1];
-            ApplyItemSettings(item, settings);
-            return TransferPages(item, settings.MaximumPages, SelectTransferFormat(item, settings.Duplex));
-        }
-        catch (COMException exception) when (exception.HResult == WiaErrorDeviceCommunication)
-        {
-            throw new ScannerUnavailableException("The configured scanner cannot be contacted.");
-        }
-        finally
-        {
-            ReleaseCom(item);
-            ReleaseCom(items);
-            ReleaseCom(device);
-            ReleaseCom(selectedInfo);
-            ReleaseCom(infos);
-            ReleaseCom(manager);
-        }
-    }
-
-    private dynamic? FindConfiguredDevice(dynamic infos, AppSettings settings)
-    {
-        dynamic? nameMatch = null;
-        var count = (int)infos.Count;
-        for (var index = 1; index <= count; index++)
-        {
-            dynamic? info = null;
-            try
-            {
-                info = infos[index];
-                if ((int)info.Type != WiaConstants.ScannerDeviceType) continue;
-                var id = ReadPropertyAsString(info.Properties, WiaConstants.DeviceId);
-                var name = ReadPropertyAsString(info.Properties, WiaConstants.DeviceName);
-                if (!string.IsNullOrWhiteSpace(settings.ScannerDeviceId) &&
-                    string.Equals(id, settings.ScannerDeviceId, StringComparison.Ordinal))
-                {
-                    ReleaseCom(nameMatch);
-                    return info;
-                }
-                if (nameMatch is null && !string.IsNullOrWhiteSpace(settings.ScannerName) &&
-                    string.Equals(name, settings.ScannerName, StringComparison.Ordinal))
-                {
-                    nameMatch = info;
-                    info = null;
-                }
-            }
-            finally { ReleaseCom(info); }
-        }
-        return nameMatch;
-    }
-
-    private void ApplyDeviceSettings(dynamic device, AppSettings settings)
-    {
-        var handling = WiaConstants.Feeder | WiaConstants.AutoAdvance;
-        if (settings.Duplex) handling |= WiaConstants.Duplex;
-        TrySetProperty(device.Properties, WiaConstants.DocumentHandlingSelect, handling, "document handling");
-        TrySetProperty(device.Properties, WiaConstants.Pages, settings.MaximumPages, "maximum pages");
-    }
-
-    private void ApplyItemSettings(dynamic item, AppSettings settings)
-    {
-        TrySetProperty(item.Properties, WiaConstants.HorizontalResolution, settings.Dpi, "horizontal resolution");
-        TrySetProperty(item.Properties, WiaConstants.VerticalResolution, settings.Dpi, "vertical resolution");
-        var intent = settings.ColourMode switch
-        {
-            ScanColourMode.Colour => WiaConstants.IntentColour,
-            ScanColourMode.Greyscale => WiaConstants.IntentGreyscale,
-            _ => WiaConstants.IntentText
-        };
-        TrySetProperty(item.Properties, WiaConstants.CurrentIntent, intent, "colour mode");
-
-        var requestedPage = settings.PaperSize == ScanPaperSize.Automatic ? WiaConstants.PageAuto : WiaConstants.PageA4;
-        if (!TrySetProperty(item.Properties, WiaConstants.PageSize, requestedPage, "paper size") &&
-            settings.PaperSize == ScanPaperSize.Automatic)
-        {
-            TrySetProperty(item.Properties, WiaConstants.PageSize, WiaConstants.PageA4, "A4 fallback");
-        }
-        if (settings.PaperSize == ScanPaperSize.A4)
-        {
-            TrySetProperty(item.Properties, WiaConstants.HorizontalExtent, (int)Math.Round(8.27 * settings.Dpi), "A4 width");
-            TrySetProperty(item.Properties, WiaConstants.VerticalExtent, (int)Math.Round(11.69 * settings.Dpi), "A4 height");
-        }
-    }
-
-    private string SelectTransferFormat(dynamic item, bool duplex)
-    {
-        dynamic? formats = null;
-        try
-        {
-            formats = item.Formats;
-            var supported = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            var count = (int)formats.Count;
-            for (var index = 1; index <= count; index++)
-                supported.Add(Convert.ToString(formats[index]) ?? string.Empty);
-            var preference = duplex
-                ? new[] { WiaConstants.TiffFormat, WiaConstants.JpegFormat, WiaConstants.BmpFormat }
-                : new[] { WiaConstants.JpegFormat, WiaConstants.TiffFormat, WiaConstants.BmpFormat };
-            var selected = preference.FirstOrDefault(supported.Contains);
-            if (selected is null) throw new InvalidDataException("The scanner does not advertise JPEG, BMP, or TIFF transfer support.");
-            return selected;
-        }
-        finally { ReleaseCom(formats); }
-    }
-
-    private ScanAcquisition TransferPages(dynamic item, int maximumPages, string format)
-    {
-        var pages = new List<ScanPage>();
-        for (var index = 0; index < maximumPages; index++)
-        {
-            dynamic? image = null;
-            dynamic? fileData = null;
-            try
-            {
-                image = item.Transfer(format);
-                fileData = image.FileData;
-                var bytes = (byte[])fileData.BinaryData;
-                var returnedFormat = ((string?)image.FormatID ?? format).ToUpperInvariant();
-                pages.Add(new(bytes, FormatName(returnedFormat)));
-            }
-            catch (COMException exception) when (exception.HResult == WiaErrorPaperEmpty)
-            {
-                break;
-            }
-            finally
-            {
-                ReleaseCom(fileData);
-                ReleaseCom(image);
-            }
-        }
-        if (pages.Count == 0) throw new NoPagesException("No document or pages were acquired.");
-        return new(pages);
-    }
-
-    private bool TrySetProperty(dynamic properties, int propertyId, object value, string settingName)
-    {
-        dynamic? property = null;
-        try
-        {
-            var count = (int)properties.Count;
-            for (var index = 1; index <= count; index++)
-            {
-                dynamic? candidate = null;
-                try
-                {
-                    candidate = properties[index];
-                    if ((int)candidate.PropertyID != propertyId) continue;
-                    property = candidate;
-                    candidate = null;
-                    break;
-                }
-                finally { ReleaseCom(candidate); }
-            }
-            if (property is null)
-            {
-                logger.LogInformation("WIA setting {SettingName} is unsupported", settingName);
-                return false;
-            }
-            property.Value = value;
-            return true;
-        }
-        catch (COMException exception)
-        {
-            logger.LogInformation(exception, "WIA driver rejected setting {SettingName}; a safe driver fallback will be used", settingName);
-            return false;
-        }
-        finally
-        {
-            ReleaseCom(property);
-            ReleaseCom(properties);
         }
     }
 
@@ -265,19 +182,33 @@ public sealed class WiaScannerService : IScannerBackend, IDisposable
         finally { ReleaseCom(properties); }
     }
 
-    private static object CreateComObject(string progId)
+    private static int? ReadPropertyAsInt(dynamic properties, int propertyId)
     {
-        var type = Type.GetTypeFromProgID(progId) ?? throw new PlatformNotSupportedException("Windows Image Acquisition is unavailable.");
-        return Activator.CreateInstance(type) ?? throw new InvalidOperationException("Windows Image Acquisition could not be started.");
+        try
+        {
+            var count = (int)properties.Count;
+            for (var index = 1; index <= count; index++)
+            {
+                dynamic? property = null;
+                try
+                {
+                    property = properties[index];
+                    if ((int)property.PropertyID == propertyId) return Convert.ToInt32(property.Value);
+                }
+                finally { ReleaseCom(property); }
+            }
+            return null;
+        }
+        finally { ReleaseCom(properties); }
     }
 
-    private static string FormatName(string formatId) => formatId switch
+    private static object CreateComObject(string progId)
     {
-        WiaConstants.JpegFormat => "jpeg",
-        WiaConstants.BmpFormat => "bmp",
-        WiaConstants.TiffFormat => "tiff",
-        _ => throw new InvalidDataException("The scanner returned an unsupported image format.")
-    };
+        var type = Type.GetTypeFromProgID(progId) ??
+                   throw new PlatformNotSupportedException("Windows Image Acquisition is unavailable.");
+        return Activator.CreateInstance(type) ??
+               throw new InvalidOperationException("Windows Image Acquisition could not be started.");
+    }
 
     private static void ReleaseCom(object? value)
     {
