@@ -11,7 +11,7 @@ jobs:
   release:
     runs-on: windows-latest
     env:
-      CERTIFICATE_PATH: ${{ runner.temp }}\scanbridge-signing.pfx
+      CERTIFICATE_PATH: scanbridge-signing.pfx
       EXE_PATH: publish\win-x64\CS3.ScanBridge.exe
     steps:
       - uses: actions/checkout@v4
